@@ -1,10 +1,49 @@
 <?php
 session_start();
 
+require_once 'db.php';
+
 if (!isset($_SESSION['user_id'])) {
     header("Location: login.php");
     exit;
 }
+
+// Redirigir si no se ha seleccionado una empresa
+if (!isset($_SESSION['empresa_id'])) {
+    header("Location: selector.php");
+    exit;
+}
+
+// Generar y almacenar token CSRF si no existe
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+$csrf_token = $_SESSION['csrf_token'];
+
+// --- Determinar el Periodo a Mostrar ---
+$SELECTED_YEAR = date('Y');
+$SELECTED_MONTH = date('n');
+
+// Si se seleccionó una fecha específica desde el selector
+if (isset($_GET['selected_date'])) {
+    $selected_date_str = $_GET['selected_date'];
+    $date_obj = DateTime::createFromFormat('Y-m-d', $selected_date_str);
+    if ($date_obj) {
+        $SELECTED_YEAR = (int)$date_obj->format('Y');
+        $SELECTED_MONTH = (int)$date_obj->format('n');
+    }
+} else if (isset($_GET['mes']) && isset($_GET['anio'])) { // Si se seleccionó un mes y año específicos (para compatibilidad)
+    $temp_mes = filter_var($_GET['mes'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 12]]);
+    $temp_anio = filter_var($_GET['anio'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 2000, 'max_range' => 2100]]);
+
+    if ($temp_mes !== false && $temp_anio !== false) {
+        $SELECTED_MONTH = $temp_mes;
+        $SELECTED_YEAR = $temp_anio;
+    }
+}
+
+// Formatear SELECTED_DATE para Flatpickr
+$SELECTED_DATE = date('Y-m-d', strtotime("$SELECTED_YEAR-$SELECTED_MONTH-01"));
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -18,9 +57,11 @@ if (!isset($_SESSION['user_id'])) {
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <!-- jsPDF y plugins -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+    
+    <!-- Flatpickr CSS -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/plugins/monthSelect/style.css">
+    
 
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="assets/css/style.css">
@@ -31,12 +72,15 @@ if (!isset($_SESSION['user_id'])) {
         <div class="sidebar-header">
             <h3>Solutek</h3>
             <p>Análisis de resultados</p>
+            <p class="text-white-50"><i class="fas fa-building me-2"></i><?php echo htmlspecialchars($_SESSION['empresa_nombre']); ?></p>
         </div>
         <nav class="nav flex-column">
-            <a class="nav-link active" href="#" data-view="dashboard"><i class="fas fa-tachometer-alt me-2"></i> Dashboards</a>
-            <a class="nav-link" href="#" data-view="data-management"><i class="fas fa-database me-2"></i> Gestión de Datos</a>
-            <a class="nav-link" href="#" data-view="admin"><i class="fas fa-user-shield me-2"></i> Administración</a>
-            <a class="nav-link" href="logout.php"><i class="fas fa-sign-out-alt me-2"></i> Cerrar Sesión</a>
+            <a class="nav-link active" href="#" data-view="dashboard"><i class="fas fa-tachometer-alt me-2"></i> <span>Dashboards</span></a>
+            <a class="nav-link" href="#" data-view="data-management"><i class="fas fa-database me-2"></i> <span>Gestión de Datos</span></a>
+            <?php if (isset($_SESSION['is_superuser']) && $_SESSION['is_superuser']): ?>
+                <a class="nav-link" href="#" data-view="admin"><i class="fas fa-user-shield me-2"></i> <span>Administración</span></a>
+            <?php endif; ?>
+            <a class="nav-link" href="logout.php"><i class="fas fa-sign-out-alt me-2"></i> <span>Cerrar Sesión</span></a>
         </nav>
     </div>
 
@@ -54,55 +98,17 @@ if (!isset($_SESSION['user_id'])) {
                 <?php include 'views/data_management.php'; ?>
             </div>
             <div id="admin-view" style="display: none;">
-                <?php include 'views/admin.php'; ?>
-            </div>
+</div>
         </main>
     </div>
 
     <!-- Bootstrap JS -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Flatpickr JS -->
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/es.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/plugins/monthSelect/index.js"></script>
     <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            const navLinks = document.querySelectorAll('.sidebar .nav-link');
-            const views = {
-                'dashboard': document.getElementById('dashboard-view'),
-                'data-management': document.getElementById('data-management-view'),
-                'admin': document.getElementById('admin-view')
-            };
-
-            function switchView(viewName) {
-                if (!views[viewName]) return;
-
-                navLinks.forEach(l => {
-                    l.classList.toggle('active', l.dataset.view === viewName);
-                });
-
-                for (const key in views) {
-                    views[key].style.display = (key === viewName) ? 'block' : 'none';
-                }
-            }
-
-            navLinks.forEach(link => {
-                link.addEventListener('click', function(e) {
-                    e.preventDefault();
-                    const viewName = this.dataset.view;
-                    switchView(viewName);
-                    window.location.hash = viewName;
-                });
-            });
-
-            const urlParams = new URLSearchParams(window.location.search);
-            const paramView = urlParams.get('view');
-            const hashView = window.location.hash.substring(1);
-
-            const initialView = paramView || hashView || 'dashboard';
-            switchView(initialView);
-
-            if (paramView) {
-                history.replaceState(null, '', `index.php#${paramView}`);
-            }
-        });
+        window.CSRF_TOKEN = '<?php echo $csrf_token; ?>';
     </script>
-
-</body>
-</html>
+    <script src="assets/js/main.js"></script>

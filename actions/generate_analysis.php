@@ -1,4 +1,11 @@
 <?php
+session_start();
+
+if (!isset($_SESSION['user_id']) || !isset($_SESSION['empresa_id'])) {
+    header("Location: ../login.php");
+    exit;
+}
+
 require_once '../db.php';
 
 header('Content-Type: text/html; charset=utf-8');
@@ -6,6 +13,7 @@ header('Content-Type: text/html; charset=utf-8');
 // --- OBTENER EL PERIODO DE LA URL ---
 $mes = $_GET['mes'] ?? date('n');
 $anio = $_GET['anio'] ?? date('Y');
+$empresa_id = $_SESSION['empresa_id'];
 
 // --- OBTENER DATOS DEL PERIODO ANTERIOR PARA COMPARACIÓN ---
 $fecha_actual = new DateTime("$anio-$mes-01");
@@ -14,33 +22,33 @@ $mes_anterior = $fecha_anterior->format('n');
 $anio_anterior = $fecha_anterior->format('Y');
 
 // --- RECOPILAR DATOS ---
-$stmt = $conn->prepare("SELECT * FROM datos_financieros WHERE anio = ? AND mes = ?");
-$stmt->bind_param("ii", $anio, $mes);
+$stmt = $conn->prepare("SELECT * FROM datos_financieros WHERE anio = ? AND mes = ? AND empresa_id = ?");
+$stmt->bind_param("iii", $anio, $mes, $empresa_id);
 $stmt->execute();
 $financiero_actual = $stmt->get_result()->fetch_assoc() ?? ['facturacion_cobrada' => 0, 'facturas_cobradas' => 0];
-$stmt = $conn->prepare("SELECT * FROM datos_financieros WHERE anio = ? AND mes = ?");
-$stmt->bind_param("ii", $anio_anterior, $mes_anterior);
+$stmt = $conn->prepare("SELECT * FROM datos_financieros WHERE anio = ? AND mes = ? AND empresa_id = ?");
+$stmt->bind_param("iii", $anio_anterior, $mes_anterior, $empresa_id);
 $stmt->execute();
 $financiero_anterior = $stmt->get_result()->fetch_assoc() ?? ['facturacion_cobrada' => 0, 'facturas_cobradas' => 0];
-$stmt = $conn->prepare("SELECT * FROM metas_generales WHERE anio = ? AND mes = ?");
-$stmt->bind_param("ii", $anio, $mes);
+$stmt = $conn->prepare("SELECT * FROM metas_generales WHERE anio = ? AND mes = ? AND empresa_id = ?");
+$stmt->bind_param("iii", $anio, $mes, $empresa_id);
 $stmt->execute();
 $metas = $stmt->get_result()->fetch_assoc() ?? ['meta_instalaciones' => 0, 'meta_clientes' => 0];
-$stmt = $conn->prepare("SELECT SUM(instalaciones) as total FROM rendimiento_sedes WHERE anio = ? AND mes = ?");
-$stmt->bind_param("ii", $anio, $mes);
+$stmt = $conn->prepare("SELECT SUM(instalaciones) as total FROM rendimiento_sedes WHERE anio = ? AND mes = ? AND empresa_id = ?");
+$stmt->bind_param("iii", $anio, $mes, $empresa_id);
 $stmt->execute();
 $total_instalaciones = $stmt->get_result()->fetch_assoc()['total'] ?? 0;
 
-$stmt = $conn->prepare("SELECT s.nombre, rs.instalaciones FROM rendimiento_sedes rs JOIN sedes s ON rs.sede_id = s.id WHERE rs.anio = ? AND rs.mes = ? ORDER BY rs.instalaciones DESC");
-$stmt->bind_param("ii", $anio, $mes);
+$stmt = $conn->prepare("SELECT s.nombre, rs.instalaciones FROM rendimiento_sedes rs JOIN sedes s ON rs.sede_id = s.id WHERE rs.anio = ? AND rs.mes = ? AND rs.empresa_id = ? ORDER BY rs.instalaciones DESC");
+$stmt->bind_param("iii", $anio, $mes, $empresa_id);
 $stmt->execute();
 $sedes_rendimiento = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt = $conn->prepare("SELECT a.nombre, ra.cierres, ra.meta_cierres FROM rendimiento_agentes ra JOIN agentes a ON ra.agente_id = a.id WHERE ra.anio = ? AND ra.mes = ?");
-$stmt->bind_param("ii", $anio, $mes);
+$stmt = $conn->prepare("SELECT a.nombre, ra.cierres, ra.meta_cierres FROM rendimiento_agentes ra JOIN agentes a ON ra.agente_id = a.id WHERE ra.anio = ? AND ra.mes = ? AND ra.empresa_id = ?");
+$stmt->bind_param("iii", $anio, $mes, $empresa_id);
 $stmt->execute();
 $agentes_rendimiento = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt = $conn->prepare("SELECT c.nombre, rc.cierres, rc.meta_cierres FROM rendimiento_closers rc JOIN closers c ON rc.closer_id = c.id WHERE rc.anio = ? AND rc.mes = ?");
-$stmt->bind_param("ii", $anio, $mes);
+$stmt = $conn->prepare("SELECT c.nombre, rc.cierres, rc.meta_cierres FROM rendimiento_closers rc JOIN closers c ON rc.closer_id = c.id WHERE rc.anio = ? AND rc.mes = ? AND rc.empresa_id = ?");
+$stmt->bind_param("iii", $anio, $mes, $empresa_id);
 $stmt->execute();
 $closers_rendimiento = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
@@ -93,9 +101,9 @@ $cumplimiento_instalaciones = ($metas['meta_instalaciones'] > 0) ? ($total_insta
                 $sede_lider = $sedes_rendimiento[0];
                 $sede_rezagada = end($sedes_rendimiento);
             ?>
-                <p>La sede líder este mes fue <strong><?php echo $sede_lider['nombre']; ?></strong> con <strong><?php echo $sede_lider['instalaciones']; ?></strong> instalaciones, aportando un <strong><?php echo ($total_instalaciones > 0) ? round(($sede_lider['instalaciones'] / $total_instalaciones) * 100) : 0; ?>%</strong> del total.</p>
+                <p>La sede líder este mes fue <strong><?php echo htmlspecialchars($sede_lider['nombre']); ?></strong> con <strong><?php echo $sede_lider['instalaciones']; ?></strong> instalaciones, aportando un <strong><?php echo ($total_instalaciones > 0) ? round(($sede_lider['instalaciones'] / $total_instalaciones) * 100) : 0; ?>%</strong> del total.</p>
                 <?php if (count($sedes_rendimiento) > 1): ?>
-                <p>La sede con menor rendimiento fue <strong><?php echo $sede_rezagada['nombre']; ?></strong> con <strong><?php echo $sede_rezagada['instalaciones']; ?></strong> instalaciones.</p>
+                <p>La sede con menor rendimiento fue <strong><?php echo htmlspecialchars($sede_rezagada['nombre']); ?></strong> con <strong><?php echo $sede_rezagada['instalaciones']; ?></strong> instalaciones.</p>
                 <?php endif; ?>
             <?php else: ?>
                 <p>No hay datos de rendimiento de sedes para este periodo.</p>
@@ -116,10 +124,10 @@ $cumplimiento_instalaciones = ($metas['meta_instalaciones'] > 0) ? ($total_insta
                 }
             }
             if ($agente_lider): ?>
-                <p>El agente con mejor cumplimiento de meta fue <strong><?php echo $agente_lider['nombre']; ?></strong>, alcanzando un <strong><?php echo round($agente_lider['cumplimiento']); ?>%</strong> de su objetivo.</p>
+                <p>El agente con mejor cumplimiento de meta fue <strong><?php echo htmlspecialchars($agente_lider['nombre']); ?></strong>, alcanzando un <strong><?php echo round($agente_lider['cumplimiento']); ?>%</strong> de su objetivo.</p>
             <?php endif; ?>
             <?php if (!empty($agentes_bajo_meta)): ?>
-                <p><strong><?php echo count($agentes_bajo_meta); ?></strong> agente(s) no alcanzaron su meta de cierres: <?php echo implode(', ', $agentes_bajo_meta); ?>.</p>
+                <p><strong><?php echo count($agentes_bajo_meta); ?></strong> agente(s) no alcanzaron su meta de cierres: <?php echo htmlspecialchars(implode(', ', $agentes_bajo_meta)); ?>.</p>
             <?php else: ?>
                 <p>¡Felicidades! Todos los agentes alcanzaron su meta de cierres este mes.</p>
             <?php endif; ?>

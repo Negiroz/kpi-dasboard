@@ -11,7 +11,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (empty($username) || empty($password)) {
         $error_message = "Por favor, ingrese su usuario y contraseña.";
     } else {
-        $stmt = $conn->prepare("SELECT id, username, password FROM usuarios WHERE username = ?");
+        $stmt = $conn->prepare("SELECT id, username, password, is_superuser FROM usuarios WHERE username = ?");
         $stmt->bind_param("s", $username);
         $stmt->execute();
         $result = $stmt->get_result();
@@ -20,7 +20,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($user && password_verify($password, $user['password'])) {
             $_SESSION['user_id'] = $user['id'];
             $_SESSION['username'] = $user['username'];
-            header("Location: index.php");
+            $_SESSION['is_superuser'] = (bool)$user['is_superuser']; // Guardar estado de superusuario
+            header("Location: selector.php");
             exit;
         } else {
             $error_message = "Usuario o contraseña incorrectos.";

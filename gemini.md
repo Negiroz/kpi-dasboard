@@ -1,0 +1,1 @@
+Solo puedes utilizar el idioma castellano para comunicarte

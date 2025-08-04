@@ -1,16 +1,15 @@
 <?php
-require_once 'db.php';
 
-// --- Determinar el Periodo a Mostrar ---
-if (isset($_GET['mes']) && isset($_GET['anio'])) {
-    $SELECTED_YEAR = $_GET['anio'];
-    $SELECTED_MONTH = $_GET['mes'];
-} else {
-    $latest_period_query = $conn->query("SELECT MAX(anio) as max_anio, MAX(mes) as max_mes FROM datos_financieros");
-    $latest_period = $latest_period_query->fetch_assoc();
-    $SELECTED_YEAR = $latest_period['max_anio'] ?? date('Y');
-    $SELECTED_MONTH = $latest_period['max_mes'] ?? date('n');
+if (!isset($_SESSION['user_id']) || !isset($_SESSION['empresa_id'])) {
+    header("Location: login.php");
+    exit;
 }
+
+
+
+$empresa_id = $_SESSION['empresa_id'];
+
+
 
 // --- Generar Periodos (6 meses hacia atrás desde el seleccionado) ---
 $periodos = [];
@@ -25,12 +24,12 @@ for ($i = 5; $i >= 0; $i--) {
 // --- Obtener Datos de la Base de Datos para el Periodo ---
 
 // KPIs Generales
-$stmt = $conn->prepare("SELECT * FROM metas_generales WHERE anio = ? AND mes = ?");
-$stmt->bind_param("ii", $SELECTED_YEAR, $SELECTED_MONTH);
+$stmt = $conn->prepare("SELECT * FROM metas_generales WHERE anio = ? AND mes = ? AND empresa_id = ?");
+$stmt->bind_param("iii", $SELECTED_YEAR, $SELECTED_MONTH, $empresa_id);
 $stmt->execute();
 $general_kpis = $stmt->get_result()->fetch_assoc() ?? [];
-$stmt = $conn->prepare("SELECT SUM(instalaciones) as total FROM rendimiento_sedes WHERE anio = ? AND mes = ?");
-$stmt->bind_param("ii", $SELECTED_YEAR, $SELECTED_MONTH);
+$stmt = $conn->prepare("SELECT SUM(instalaciones) as total FROM rendimiento_sedes WHERE anio = ? AND mes = ? AND empresa_id = ?");
+$stmt->bind_param("iii", $SELECTED_YEAR, $SELECTED_MONTH, $empresa_id);
 $stmt->execute();
 $total_instalaciones = $stmt->get_result()->fetch_assoc()['total'] ?? 0;
 $general_kpis['instalaciones_actuales'] = $total_instalaciones;
@@ -45,8 +44,8 @@ foreach ($periodos as $p) {
     $params[] = $p['mes'];
 }
 
-$stmt = $conn->prepare("SELECT mes, anio, facturacion_cobrada, facturas_cobradas FROM datos_financieros WHERE (anio, mes) IN ($placeholders) ORDER BY anio ASC, mes ASC");
-$stmt->bind_param($types, ...$params);
+$stmt = $conn->prepare("SELECT mes, anio, facturacion_cobrada, facturas_cobradas FROM datos_financieros WHERE empresa_id = ? AND (anio, mes) IN ($placeholders) ORDER BY anio ASC, mes ASC");
+$stmt->bind_param("i" . $types, $empresa_id, ...$params);
 $stmt->execute();
 $result = $stmt->get_result();
 while ($row = $result->fetch_assoc()) {
@@ -83,21 +82,34 @@ $general_kpis['fecha_proyeccion'] = $fecha_proyeccion;
 
 // Datos Sedes (Histórico)
 $sedes_data = [];
-$sedes_result = $conn->query("SELECT id, nombre FROM sedes ORDER BY nombre");
+$stmt_sedes = $conn->prepare("SELECT id, nombre FROM sedes WHERE empresa_id = ? ORDER BY nombre");
+$stmt_sedes->bind_param("i", $empresa_id);
+$stmt_sedes->execute();
+$sedes_result = $stmt_sedes->get_result();
 $all_sedes = [];
 while($sede = $sedes_result->fetch_assoc()) {
-    $all_sedes[$sede['id']] = ['nombre' => $sede['nombre'], 'historico' => array_fill(0, count($periodos), 0)];
+    $all_sedes[$sede['id']] = ['id' => $sede['id'], 'nombre' => $sede['nombre'], 'historico' => array_fill(0, count($periodos), 0)];
 }
 
-$sede_placeholders = implode(', ', array_fill(0, count($all_sedes), '?'));
-$period_placeholders = implode(', ', array_fill(0, count($periodos), '(?, ?)'));
-$types = str_repeat('i', count($all_sedes)) . str_repeat('ii', count($periodos));
-$params = array_merge(array_keys($all_sedes), ...array_map(function($p) { return [$p['anio'], $p['mes']]; }, $periodos));
+if (!empty($all_sedes)) {
+    
+    $sede_placeholders = implode(', ', array_fill(0, count($all_sedes), '?'));
+    $period_params = [];
+    foreach ($periodos as $p) {
+        $period_params[] = $p['anio'];
+        $period_params[] = $p['mes'];
+    }
+    $period_placeholders = implode(', ', array_fill(0, count($periodos), '(?, ?)'));
+    $types = str_repeat('i', count($all_sedes)) . str_repeat('ii', count($periodos));
+    $params = array_merge(array_keys($all_sedes), $period_params);
 
-$stmt = $conn->prepare("SELECT sede_id, mes, anio, instalaciones FROM rendimiento_sedes WHERE sede_id IN ($sede_placeholders) AND (anio, mes) IN ($period_placeholders) ORDER BY sede_id, anio, mes");
-$stmt->bind_param($types, ...$params);
-$stmt->execute();
-$rendimiento_sedes_raw = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt = $conn->prepare("SELECT sede_id, mes, anio, instalaciones FROM rendimiento_sedes WHERE empresa_id = ? AND sede_id IN ($sede_placeholders) AND (anio, mes) IN ($period_placeholders) ORDER BY sede_id, anio, mes");
+    $stmt->bind_param("i" . $types, $empresa_id, ...$params);
+    $stmt->execute();
+    $rendimiento_sedes_raw = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+} else {
+    $rendimiento_sedes_raw = [];
+}
 
 $rendimiento_lookup = [];
 foreach ($rendimiento_sedes_raw as $row) {
@@ -112,27 +124,45 @@ foreach ($all_sedes as $id => $data) {
     }
 }
 
+// Ordenar sedes por las instalaciones del último mes (de mayor a menor)
+usort($sedes_data, function($a, $b) use ($periodos) {
+    $last_month_idx = count($periodos) - 1;
+    return $b['historico'][$last_month_idx] <=> $a['historico'][$last_month_idx];
+});
+
 // Datos Agentes (KPIs Mes Seleccionado + Histórico)
-$stmt = $conn->prepare("SELECT a.nombre, ra.* FROM rendimiento_agentes ra JOIN agentes a ON ra.agente_id = a.id WHERE ra.anio = ? AND ra.mes = ? ORDER BY a.nombre");
-$stmt->bind_param("ii", $SELECTED_YEAR, $SELECTED_MONTH);
+$stmt = $conn->prepare("SELECT a.nombre, s.nombre AS sede_nombre, ra.* FROM rendimiento_agentes ra JOIN agentes a ON ra.agente_id = a.id JOIN sedes s ON a.sede_id = s.id WHERE ra.anio = ? AND ra.mes = ? AND ra.empresa_id = ? ORDER BY ra.cierres DESC");
+$stmt->bind_param("iii", $SELECTED_YEAR, $SELECTED_MONTH, $empresa_id);
 $stmt->execute();
 $agentes_kpi = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $agentes_data = [];
-$agentes_result = $conn->query("SELECT id, nombre FROM agentes ORDER BY nombre");
+$stmt_agentes = $conn->prepare("SELECT id, nombre FROM agentes WHERE empresa_id = ? ORDER BY nombre");
+$stmt_agentes->bind_param("i", $empresa_id);
+$stmt_agentes->execute();
+$agentes_result = $stmt_agentes->get_result();
 $all_agentes = [];
 while($agente = $agentes_result->fetch_assoc()) {
-    $all_agentes[$agente['id']] = ['nombre' => $agente['nombre'], 'historico_cierres' => array_fill(0, count($periodos), 0)];
+    $all_agentes[$agente['id']] = ['id' => $agente['id'], 'nombre' => $agente['nombre'], 'historico_cierres' => array_fill(0, count($periodos), 0)];
 }
 
-$agente_placeholders = implode(', ', array_fill(0, count($all_agentes), '?'));
-$period_placeholders = implode(', ', array_fill(0, count($periodos), '(?, ?)'));
-$types = str_repeat('i', count($all_agentes)) . str_repeat('ii', count($periodos));
-$params = array_merge(array_keys($all_agentes), ...array_map(function($p) { return [$p['anio'], $p['mes']]; }, $periodos));
+if (!empty($all_agentes)) {
+    $agente_placeholders = implode(', ', array_fill(0, count($all_agentes), '?'));
+    $period_params = [];
+    foreach ($periodos as $p) {
+        $period_params[] = $p['anio'];
+        $period_params[] = $p['mes'];
+    }
+    $period_placeholders = implode(', ', array_fill(0, count($periodos), '(?, ?)'));
+    $types = str_repeat('i', count($all_agentes)) . str_repeat('ii', count($periodos));
+    $params = array_merge(array_keys($all_agentes), $period_params);
 
-$stmt = $conn->prepare("SELECT agente_id, mes, anio, cierres FROM rendimiento_agentes WHERE agente_id IN ($agente_placeholders) AND (anio, mes) IN ($period_placeholders) ORDER BY agente_id, anio, mes");
-$stmt->bind_param($types, ...$params);
-$stmt->execute();
-$rendimiento_agentes_raw = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt = $conn->prepare("SELECT agente_id, mes, anio, cierres FROM rendimiento_agentes WHERE empresa_id = ? AND agente_id IN ($agente_placeholders) AND (anio, mes) IN ($period_placeholders) ORDER BY agente_id, anio, mes");
+    $stmt->bind_param("i" . $types, $empresa_id, ...$params);
+    $stmt->execute();
+    $rendimiento_agentes_raw = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+} else {
+    $rendimiento_agentes_raw = [];
+}
 
 $rendimiento_lookup = [];
 foreach ($rendimiento_agentes_raw as $row) {
@@ -148,26 +178,38 @@ foreach ($all_agentes as $id => $data) {
 }
 
 // Datos Closers (KPIs Mes Seleccionado + Histórico)
-$stmt = $conn->prepare("SELECT c.nombre, rc.* FROM rendimiento_closers rc JOIN closers c ON rc.closer_id = c.id WHERE rc.anio = ? AND rc.mes = ? ORDER BY c.nombre");
-$stmt->bind_param("ii", $SELECTED_YEAR, $SELECTED_MONTH);
+$stmt = $conn->prepare("SELECT c.nombre, rc.* FROM rendimiento_closers rc JOIN closers c ON rc.closer_id = c.id WHERE rc.anio = ? AND rc.mes = ? AND rc.empresa_id = ? ORDER BY rc.cierres DESC");
+$stmt->bind_param("iii", $SELECTED_YEAR, $SELECTED_MONTH, $empresa_id);
 $stmt->execute();
 $closers_kpi = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $closers_data = [];
-$closers_result = $conn->query("SELECT id, nombre FROM closers ORDER BY nombre");
+$stmt_closers = $conn->prepare("SELECT id, nombre FROM closers WHERE empresa_id = ? ORDER BY nombre");
+$stmt_closers->bind_param("i", $empresa_id);
+$stmt_closers->execute();
+$closers_result = $stmt_closers->get_result();
 $all_closers = [];
 while($closer = $closers_result->fetch_assoc()) {
-    $all_closers[$closer['id']] = ['nombre' => $closer['nombre'], 'historico_cierres' => array_fill(0, count($periodos), 0)];
+    $all_closers[$closer['id']] = ['id' => $closer['id'], 'nombre' => $closer['nombre'], 'historico_cierres' => array_fill(0, count($periodos), 0)];
 }
 
-$closer_placeholders = implode(', ', array_fill(0, count($all_closers), '?'));
-$period_placeholders = implode(', ', array_fill(0, count($periodos), '(?, ?)'));
-$types = str_repeat('i', count($all_closers)) . str_repeat('ii', count($periodos));
-$params = array_merge(array_keys($all_closers), ...array_map(function($p) { return [$p['anio'], $p['mes']]; }, $periodos));
+if (!empty($all_closers)) {
+    $closer_placeholders = implode(', ', array_fill(0, count($all_closers), '?'));
+    $period_params = [];
+    foreach ($periodos as $p) {
+        $period_params[] = $p['anio'];
+        $period_params[] = $p['mes'];
+    }
+    $period_placeholders = implode(', ', array_fill(0, count($periodos), '(?, ?)'));
+    $types = str_repeat('i', count($all_closers)) . str_repeat('ii', count($periodos));
+    $params = array_merge(array_keys($all_closers), $period_params);
 
-$stmt = $conn->prepare("SELECT closer_id, mes, anio, cierres FROM rendimiento_closers WHERE closer_id IN ($closer_placeholders) AND (anio, mes) IN ($period_placeholders) ORDER BY closer_id, anio, mes");
-$stmt->bind_param($types, ...$params);
-$stmt->execute();
-$rendimiento_closers_raw = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt = $conn->prepare("SELECT closer_id, mes, anio, cierres FROM rendimiento_closers WHERE empresa_id = ? AND closer_id IN ($closer_placeholders) AND (anio, mes) IN ($period_placeholders) ORDER BY closer_id, anio, mes");
+    $stmt->bind_param("i" . $types, $empresa_id, ...$params);
+    $stmt->execute();
+    $rendimiento_closers_raw = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+} else {
+    $rendimiento_closers_raw = [];
+}
 
 $rendimiento_lookup = [];
 foreach ($rendimiento_closers_raw as $row) {
@@ -184,13 +226,20 @@ foreach ($all_closers as $id => $data) {
 
 ?>
 
-<div class="container-fluid">
-    <div class="d-flex justify-content-between align-items-center mb-3">
-        <h1 class="h2">Dashboard</h1>
-        <button id="export-pdf-btn" class="btn btn-danger"><i class="fas fa-file-pdf me-2"></i> Exportar a PDF</button>
-    </div>
 
-    
+
+<div class="container-fluid">
+    <div class="mb-3">
+        <h1 class="h2">Dashboard</h1>
+        <?php 
+            $meses_espanol = [
+                1 => 'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+                'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
+            ];
+            $nombre_mes = $meses_espanol[(int)$SELECTED_MONTH];
+        ?>
+        <p class="text-muted">Datos del mes de <?php echo $nombre_mes . ' ' . $SELECTED_YEAR; ?></p>
+    </div>
 
     <!-- Nav tabs -->
     <ul class="nav nav-tabs" id="dashboardTab" role="tablist">
@@ -227,7 +276,7 @@ foreach ($all_closers as $id => $data) {
                             <h5 class="card-title">Proyección de Clientes</h5>
                             <p class="kpi-card-value"><?php echo number_format($general_kpis['clientes_actuales'] ?? 0); ?> / <span class="kpi-card-meta"><?php echo number_format($general_kpis['meta_clientes'] ?? 0); ?></span></p>
                             <p class="kpi-card-text mb-0">Faltan <strong><?php echo number_format($general_kpis['clientes_faltantes'] ?? 0); ?></strong> para la meta.</p>
-                            <p class="kpi-card-text"><small>Fecha estimada: <strong><?php echo $general_kpis['fecha_proyeccion']; ?></strong></small></p>
+                            <p class="kpi-card-text"><small>Fecha estimada: <strong><?php echo htmlspecialchars($general_kpis['fecha_proyeccion']); ?></strong></small></p>
                         </div>
                     </div>
                 </div>
@@ -296,11 +345,11 @@ foreach ($all_closers as $id => $data) {
                                     <?php 
                                     $totals_por_mes = array_fill(0, 6, 0);
                                     $grand_total = 0;
-                                    foreach($sedes_data as $sede): 
+                                    foreach($sedes_data as $id => $sede): 
                                         $total_sede = array_sum($sede['historico']);
                                         $grand_total += $total_sede;
                                     ?>
-                                    <tr>
+                                    <tr data-id="<?php echo $id; ?>">
                                         <td><?php echo htmlspecialchars($sede['nombre']); ?></td>
                                         <?php 
                                         foreach($sede['historico'] as $i => $valor) {
@@ -315,7 +364,15 @@ foreach ($all_closers as $id => $data) {
                                 <tfoot>
                                     <tr class="table-group-divider fw-bold">
                                         <td>Total General</td>
-                                        <?php foreach($totals_por_mes as $total_mes) { echo "<td>$total_mes</td>"; } ?>
+                                        <?php 
+                                        $total_instalaciones_historico = array_fill(0, count($periodos), 0);
+                                        foreach($sedes_data as $id => $sede) {
+                                            foreach($sede['historico'] as $i => $valor) {
+                                                $total_instalaciones_historico[$i] += $valor;
+                                            }
+                                        }
+                                        foreach($total_instalaciones_historico as $total_mes) { echo "<td>$total_mes</td>"; } 
+                                        ?>
                                         <td><?php echo $grand_total; ?></td>
                                     </tr>
                                 </tfoot>
@@ -343,14 +400,27 @@ foreach ($all_closers as $id => $data) {
             <div class="row mt-4">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header"><h4 class="card-title">KPIs por Agente (Mes Seleccionado)</h4></div>
+                        <div class="card-header"><h4 class="card-title">KPIs por Agente</h4></div>
                         <div class="card-body table-responsive">
                             <table class="table table-sm table-striped table-hover">
-                                <thead><tr><th>Agente</th><th>Cierres</th><th>Meta</th><th>%</th><th>Prospectos</th><th>Meta</th><th>%</th><th>Conversión</th></tr></thead>
+                                <thead><tr><th>#</th><th>Agente</th><th>Sede</th><th>Cierres</th><th>Meta C.</th><th>% Cierre</th><th>Prospectos</th><th>Meta P.</th><th>% Pros.</th><th>Conversión</th></tr></thead>
                                 <tbody>
-                                <?php foreach($agentes_kpi as $agente): ?>
-                                    <tr>
-                                        <td><?php echo $agente['nombre']; ?></td>
+                                <?php 
+                                $row_num = 1; 
+                                $total_cierres = 0;
+                                $total_meta_cierres = 0;
+                                $total_prospectos = 0;
+                                $total_meta_prospectos = 0;
+                                foreach($agentes_kpi as $agente): 
+                                    $total_cierres += $agente['cierres'];
+                                    $total_meta_cierres += $agente['meta_cierres'];
+                                    $total_prospectos += $agente['prospectos'];
+                                    $total_meta_prospectos += $agente['meta_prospectos'];
+                                ?>
+                                    <tr data-id="<?php echo $agente['agente_id']; ?>">
+                                        <td><?php echo $row_num++; ?></td>
+                                        <td><?php echo htmlspecialchars($agente['nombre']); ?></td>
+                                        <td><?php echo htmlspecialchars($agente['sede_nombre'] ?? 'N/A'); ?></td>
                                         <td><?php echo $agente['cierres']; ?></td>
                                         <td><?php echo $agente['meta_cierres']; ?></td>
                                         <td><?php echo ($agente['meta_cierres'] > 0) ? round(($agente['cierres']/$agente['meta_cierres'])*100) . '%' : 'N/A'; ?></td>
@@ -361,6 +431,18 @@ foreach ($all_closers as $id => $data) {
                                     </tr>
                                 <?php endforeach; ?>
                                 </tbody>
+                                <tfoot>
+                                    <tr class="table-group-divider fw-bold">
+                                        <td colspan="3">Total General</td>
+                                        <td><?php echo $total_cierres; ?></td>
+                                        <td><?php echo $total_meta_cierres; ?></td>
+                                        <td><?php echo ($total_meta_cierres > 0) ? round(($total_cierres/$total_meta_cierres)*100) . '%' : 'N/A'; ?></td>
+                                        <td><?php echo $total_prospectos; ?></td>
+                                        <td><?php echo $total_meta_prospectos; ?></td>
+                                        <td><?php echo ($total_meta_prospectos > 0) ? round(($total_prospectos/$total_meta_prospectos)*100) . '%' : 'N/A'; ?></td>
+                                        <td><?php echo ($total_prospectos > 0) ? round(($total_cierres/$total_prospectos)*100) . '%' : 'N/A'; ?></td>
+                                    </tr>
+                                </tfoot>
                             </table>
                         </div>
                     </div>
@@ -391,8 +473,8 @@ foreach ($all_closers as $id => $data) {
                                 <thead><tr><th>Closer</th><th>Cierres</th><th>Meta</th><th>% Cumplimiento</th></tr></thead>
                                 <tbody>
                                 <?php foreach($closers_kpi as $closer): ?>
-                                    <tr>
-                                        <td><?php echo $closer['nombre']; ?></td>
+                                    <tr data-id="<?php echo $closer['closer_id']; ?>">
+                                        <td><?php echo htmlspecialchars($closer['nombre']); ?></td>
                                         <td><?php echo $closer['cierres']; ?></td>
                                         <td><?php echo $closer['meta_cierres']; ?></td>
                                         <td><?php echo ($closer['meta_cierres'] > 0) ? round(($closer['cierres']/$closer['meta_cierres'])*100) . '%' : 'N/A'; ?></td>
@@ -442,19 +524,29 @@ foreach ($all_closers as $id => $data) {
 <script>
 document.addEventListener('DOMContentLoaded', function() {
     const chartColors = ['#0d6efd', '#198754', '#dc3545', '#ffc107', '#0dcaf0', '#6f42c1', '#fd7e14', '#20c997'];
-    const meses = <?php echo json_encode($financiero['meses']); ?>;
+    const mesesRaw = <?php echo json_encode($financiero['meses']); ?>;
+    const meses = [...new Set(mesesRaw)]; // Eliminar duplicados
     let charts = {};
     let analysisLoaded = false;
+
+    // Almacenar datos originales para filtrado
+    const originalSedesData = <?php echo json_encode(array_values($sedes_data)); ?>;
+    const originalAgentesData = <?php echo json_encode(array_values($agentes_data)); ?>;
+    const originalClosersData = <?php echo json_encode(array_values($closers_data)); ?>;
+    const totalInstalacionesHistorico = <?php echo json_encode($total_instalaciones_historico); ?>;
+
+    // Sets para mantener el estado de selección
+    let selectedSedes = new Set();
+    let selectedAgentes = new Set();
+    let selectedClosers = new Set();
 
     function initChart(id, config) {
         const canvas = document.getElementById(id);
         if (!canvas) return;
         if (charts[id]) charts[id].destroy();
         
-        // Asegurar opciones de responsividad
         config.options = config.options || {};
         config.options.responsive = true;
-        // config.options.maintainAspectRatio = false; // Eliminado para mantener el aspecto
 
         charts[id] = new Chart(canvas, config);
     }
@@ -467,20 +559,55 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     function initSedesChart() {
-        const sedesData = <?php echo json_encode(array_values($sedes_data)); ?>;
-        const datasets = sedesData.map((s, i) => ({ label: s.nombre, data: s.historico, borderColor: chartColors[i % chartColors.length], fill: false }));
+        let datasets;
+        if (selectedSedes.size === 0) {
+            // Mostrar todos si no hay selección
+            datasets = originalSedesData.map((s, i) => ({
+                label: s.nombre,
+                data: s.historico,
+                borderColor: chartColors[i % chartColors.length],
+                fill: false,
+                tension: 0.1
+            }));
+        } else {
+            // Mostrar solo los seleccionados
+            datasets = originalSedesData.filter(s => selectedSedes.has(s.id)).map((s, i) => ({
+                label: s.nombre,
+                data: s.historico,
+                borderColor: chartColors[i % chartColors.length],
+                fill: false,
+                tension: 0.1
+            }));
+        }
+        // Añadir la línea de total de instalaciones
+        datasets.push({
+            label: 'Total Instalaciones',
+            data: totalInstalacionesHistorico,
+            borderColor: '#000000', // Color negro para el total
+            borderWidth: 2,
+            fill: false,
+            tension: 0.1
+        });
         initChart('sedes-chart', { type: 'line', data: { labels: meses, datasets: datasets } });
     }
 
     function initAgentesChart() {
-        const agentesData = <?php echo json_encode(array_values($agentes_data)); ?>;
-        const datasets = agentesData.map((a, i) => ({ label: a.nombre, data: a.historico_cierres, borderColor: chartColors[i % chartColors.length], fill: false }));
+        let datasets;
+        if (selectedAgentes.size === 0) {
+            datasets = originalAgentesData.map((a, i) => ({ label: a.nombre, data: a.historico_cierres, borderColor: chartColors[i % chartColors.length], fill: false }));
+        } else {
+            datasets = originalAgentesData.filter(a => selectedAgentes.has(a.id)).map((a, i) => ({ label: a.nombre, data: a.historico_cierres, borderColor: chartColors[i % chartColors.length], fill: false }));
+        }
         initChart('agentes-chart', { type: 'line', data: { labels: meses, datasets: datasets } });
     }
 
     function initClosersChart() {
-        const closersData = <?php echo json_encode(array_values($closers_data)); ?>;
-        const datasets = closersData.map((c, i) => ({ label: c.nombre, data: c.historico_cierres, borderColor: chartColors[i % chartColors.length], fill: false }));
+        let datasets;
+        if (selectedClosers.size === 0) {
+            datasets = originalClosersData.map((c, i) => ({ label: c.nombre, data: c.historico_cierres, borderColor: chartColors[i % chartColors.length], fill: false }));
+        } else {
+            datasets = originalClosersData.filter(c => selectedClosers.has(c.id)).map((c, i) => ({ label: c.nombre, data: c.historico_cierres, borderColor: chartColors[i % chartColors.length], fill: false }));
+        }
         initChart('closers-chart', { type: 'line', data: { labels: meses, datasets: datasets } });
     }
 
@@ -529,13 +656,13 @@ document.addEventListener('DOMContentLoaded', function() {
                     initGeneralCharts(); // Siempre reinicializar los gráficos generales
                     break;
                 case '#dashboard-sedes-pane':
-                    if (!charts['sedes-chart']) initSedesChart();
+                    initSedesChart(); // Siempre reinicializar para aplicar filtros
                     break;
                 case '#dashboard-agentes-pane':
-                    if (!charts['agentes-chart']) initAgentesChart();
+                    initAgentesChart(); // Siempre reinicializar para aplicar filtros
                     break;
                 case '#dashboard-closers-pane':
-                    if (!charts['closers-chart']) initClosersChart();
+                    initClosersChart(); // Siempre reinicializar para aplicar filtros
                     break;
                 case '#dashboard-analysis-pane':
                     if (!analysisLoaded) loadAnalysis();
@@ -553,52 +680,49 @@ document.addEventListener('DOMContentLoaded', function() {
         loadAnalysis();
     });
 
-    // Lógica para exportar a PDF
-    document.getElementById('export-pdf-btn').addEventListener('click', function() {
-        const { jsPDF } = window.jspdf;
-        const doc = new jsPDF({ orientation: 'p', unit: 'pt', format: 'a4' });
+    
 
-        doc.setFontSize(18);
-        doc.text("Reporte de KPIs - <?php echo DateTime::createFromFormat('!m', $SELECTED_MONTH)->format('F') . ' ' . $SELECTED_YEAR; ?>", 40, 60);
-        
-        let yPos = 80;
-
-        const addChartToPdf = (chartId, title) => {
-            const canvas = document.getElementById(chartId);
-            if (canvas && canvas.offsetParent !== null) {
-                const imgData = canvas.toDataURL('image/png', 1.0);
-                if (yPos + 270 > doc.internal.pageSize.height) { doc.addPage(); yPos = 40; }
-                doc.setFontSize(14);
-                doc.text(title, 40, yPos);
-                yPos += 15;
-                doc.addImage(imgData, 'PNG', 40, yPos, 515, 250);
-                yPos += 270;
+    // --- Lógica de filtrado de tablas ---
+    document.querySelectorAll('#dashboard-sedes-pane table tbody tr').forEach(row => {
+        row.addEventListener('click', function() {
+            const id = parseInt(this.dataset.id);
+            if (selectedSedes.has(id)) {
+                selectedSedes.delete(id);
+                this.classList.remove('table-active');
+            } else {
+                selectedSedes.add(id);
+                this.classList.add('table-active');
             }
-        };
+            initSedesChart();
+        });
+    });
 
-        const addTableToPdf = (selector, title) => {
-            const table = document.querySelector(selector);
-            if (table) {
-                if (yPos + 50 > doc.internal.pageSize.height) { doc.addPage(); yPos = 40; }
-                doc.setFontSize(14);
-                doc.text(title, 40, yPos);
-                yPos += 20;
-                doc.autoTable({ html: selector, startY: yPos, headStyles: {fillColor: [13, 110, 253]} });
-                yPos = doc.autoTable.previous.finalY + 20;
+    document.querySelectorAll('#dashboard-agentes-pane table tbody tr').forEach(row => {
+        row.addEventListener('click', function() {
+            const id = parseInt(this.dataset.id);
+            if (selectedAgentes.has(id)) {
+                selectedAgentes.delete(id);
+                this.classList.remove('table-active');
+            } else {
+                selectedAgentes.add(id);
+                this.classList.add('table-active');
             }
-        };
+            initAgentesChart();
+        });
+    });
 
-        addChartToPdf('facturacion-chart', 'Histórico de Facturación ($)');
-        addChartToPdf('facturas-chart', 'Histórico de Facturas (#)');
-        addChartToPdf('arpu-chart', 'Comportamiento del ARPU ($)');
-        addTableToPdf('#dashboard-sedes-pane .table', 'Tabla de Datos: Instalaciones por Sede');
-        addChartToPdf('sedes-chart', 'Histórico de Instalaciones por Sede');
-        addTableToPdf('#dashboard-agentes-pane .table', 'KPIs por Agente (Mes Seleccionado)');
-        addChartToPdf('agentes-chart', 'Histórico de Cierres por Agente');
-        addTableToPdf('#dashboard-closers-pane .table', 'KPIs por Closer (Mes Seleccionado)');
-        addChartToPdf('closers-chart', 'Histórico de Cierres por Closer');
-
-        doc.save('reporte_kpi_<?php echo $SELECTED_YEAR . '_' . $SELECTED_MONTH; ?>.pdf');
+    document.querySelectorAll('#dashboard-closers-pane table tbody tr').forEach(row => {
+        row.addEventListener('click', function() {
+            const id = parseInt(this.dataset.id);
+            if (selectedClosers.has(id)) {
+                selectedClosers.delete(id);
+                this.classList.remove('table-active');
+            } else {
+                selectedClosers.add(id);
+                this.classList.add('table-active');
+            }
+            initClosersChart();
+        });
     });
 });
 </script>
