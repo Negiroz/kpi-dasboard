@@ -5,11 +5,7 @@ if (!isset($_SESSION['user_id']) || !isset($_SESSION['empresa_id'])) {
     exit;
 }
 
-
-
 $empresa_id = $_SESSION['empresa_id'];
-
-
 
 // --- Generar Periodos (6 meses hacia atrás desde el seleccionado) ---
 $periodos = [];
