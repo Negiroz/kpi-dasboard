@@ -42,12 +42,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['empresa_id'])) {
 }
 
 // 3. Obtener la lista de empresas a las que el usuario tiene acceso
-$stmt = $conn->prepare(
-    'SELECT e.id, e.nombre FROM empresas e ' .
-    'JOIN usuario_empresa ue ON e.id = ue.empresa_id ' .
-    'WHERE ue.usuario_id = ?'
-);
-$stmt->bind_param("i", $_SESSION['user_id']);
+$is_superuser = $_SESSION['is_superuser'] ?? false;
+
+if ($is_superuser) {
+    // Si es superusuario, obtiene todas las empresas
+    $stmt = $conn->prepare('SELECT id, nombre FROM empresas ORDER BY nombre');
+} else {
+    // Si no, obtiene solo las empresas a las que tiene acceso
+    $stmt = $conn->prepare(
+        'SELECT e.id, e.nombre FROM empresas e ' .
+        'JOIN usuario_empresa ue ON e.id = ue.empresa_id ' .
+        'WHERE ue.usuario_id = ? ORDER BY e.nombre'
+    );
+    $stmt->bind_param("i", $_SESSION['user_id']);
+}
+
 $stmt->execute();
 $empresas = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
